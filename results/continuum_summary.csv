@@ -1,0 +1,13 @@
+"run","config","arm","n_arrays","n_classes","smallest_class","n_stable","effective_boots"
+"multinomial_A","multinomial","A",446,3,54,16,500
+"ovr_field_A","ovr_field","A",446,2,63,8,500
+"pair_donor_field_A","pair_donor_field","A",117,2,54,4,500
+"pair_field_cancer_A","pair_field_cancer","A",392,2,63,6,500
+"multinomial_B","multinomial","B",446,3,54,5,500
+"ovr_field_B","ovr_field","B",446,2,63,0,500
+"pair_donor_field_B","pair_donor_field","B",117,2,54,1,500
+"pair_field_cancer_B","pair_field_cancer","B",392,2,63,1,500
+"multinomial_C","multinomial","C",446,3,54,10,500
+"ovr_field_C","ovr_field","C",446,2,63,1,500
+"pair_donor_field_C","pair_donor_field","C",117,2,54,5,500
+"pair_field_cancer_C","pair_field_cancer","C",392,2,63,4,500

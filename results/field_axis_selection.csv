@@ -1,0 +1,7 @@
+"arm","set","run","n_stratum","rho_pi_field","rho_pi_carcinoma","axis_correlation","shared_fraction"
+"A","DONOR","A_DONOR",6872,0.1235,0.3113,0.4857,0.742
+"A","FULL","A_FULL",6872,-0.0725,0.288,0.4857,0.742
+"B","DONOR","B_DONOR",8849,0.2347,0.3054,0.776,0.88
+"B","FULL","B_FULL",8849,0.002,0.2471,0.776,0.88
+"C","DONOR","C_DONOR",8289,0.1943,0.2895,0.5746,0.726
+"C","FULL","C_FULL",8289,-0.0102,0.2633,0.5746,0.726

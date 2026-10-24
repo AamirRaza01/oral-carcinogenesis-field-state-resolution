@@ -1,0 +1,262 @@
+# ==============================================================================
+> # Script: 12_continuum_panel.R
+> # Purpose: Select a panel that classifies the oral carcinogenesis continuum as
+> #          four states rather than two, and compare that selection against the
+> #          binary selection the field publishes.
+> #
+> # THE THREE TRAINED STATES
+> #
+> #     donor    normal mucosa from a person without oral cancer, 54 arrays
+> #     field    normal-appearing mucosa from a person who has oral cancer,
+> #              pooling the contralateral, adjacent, and matched labels, 63 arrays
+> #     cancer   carcinoma, 329 arrays
+> #
+> #   Dysplasia is excluded from training. Seventeen arrays cannot support a
+> #   fitted class, and a class that small would set the penalty for every other
+> #   class in a multinomial fit. Those arrays are scored afterwards in step 13,
+> #   where a state the model never saw provides an independent check on the
+> #   ordering rather than a fourth fitted parameter.
+> #
+> # WHY THE FIELD STATE IS THE POINT
+> #   A pathologist reports donor mucosa and field mucosa identically. Both are
+> #   normal squamous epithelium under a microscope. The distinction exists in the
+> #   deposit's provenance record and nowhere in the histology. Every published
+> #   pooled analysis assigns both to one normal class.
+> #
+> #   A colorectal continuum classifier separates normal, inflammatory bowel
+> #   disease, adenoma, and carcinoma, and a pathologist can already stage those
+> #   four. The oral trajectory carries a state that histology cannot see. That
+> #   state is what this panel resolves, and it is the state with enough arrays to
+> #   fit.
+> #
+> # CLASSIFIER CONFIGURATIONS
+> #   Stability selection runs in several parallel configurations, following the
+> #   colorectal design. The multinomial configuration asks which genes separate
+> #   all four states at once. The one-versus-rest configuration for the field
+> #   state asks which genes mark it specifically. The three adjacent pairwise
+> #   configurations ask which genes mark each single transition along the order.
+> #   Genes reaching the selection threshold in any configuration form the union
+> #   set, which describes the trajectory. The multinomial subset forms the panel
+> #   that classifies it.
+> #
+> # COUNTS
+> #   The three trained states hold 54, 63, and 329 arrays. Every split and every
+> #   bootstrap is stratified, so the class proportions are preserved throughout.
+> #
+> # INPUT   arm matrices, the manifest
+> # OUTPUT  results/continuum_panels.rds, results/continuum_frequencies.rds,
+> #         results/continuum_<config>_<arm>.csv, results/continuum_summary.csv
+> # ==============================================================================
+> 
+> source("00_oral_common.R")
+Loaded 00_oral_common.R | base_dir = E:/OralCancer_Research
+> set.seed(123)
+> 
+> suppressPackageStartupMessages({ library(glmnet); library(parallel) })
+Warning message:
+package ‘glmnet’ was built under R version 4.5.3 
+> 
+> N_BOOT    <- 500
+> ALPHA     <- 0.5
+> PI_THRESH <- 0.90
+> N_FOLDS   <- 5
+> N_WORKERS <- min(4L, max(1L, parallel::detectCores() - 1L))
+> 
+> CONTINUUM <- c("donor", "field", "cancer")
+> 
+> # Configurations to run. Trim this vector to shorten the job. Each entry costs
+> # one stability selection run per arm.
+> CONFIGS <- c("multinomial",
++              "ovr_field",
++              "pair_donor_field", "pair_field_cancer")
+> 
+> message("Detected cores: ", parallel::detectCores(), " | workers used: ", N_WORKERS)
+Detected cores: 12 | workers used: 4
+> 
+> manifest <- load_manifest()
+> 
+> # ------------------------------------------------------------------------------
+> # Continuum label
+> # ------------------------------------------------------------------------------
+> # Dysplasia receives no label, so it takes no part in any fit below.
+> continuum_label <- function(m) {
++   lab <- rep(NA_character_, nrow(m))
++   lab[m$class == "cancer"] <- "cancer"
++   lab[m$class == "normal" & m$normal_provenance == "donor"] <- "donor"
++   lab[m$class == "normal" & m$normal_provenance != "donor"] <- "field"
++   factor(lab, levels = CONTINUUM)
++ }
+> 
+> manifest$continuum <- continuum_label(manifest)
+> message("\nTrained states:")
+
+Trained states:
+> print(table(manifest$continuum, useNA = "ifany"))
+
+ donor  field cancer   <NA> 
+    54     63    329     17 
+> message(sprintf("Held out of every fit: %d dysplasia arrays",
++                 sum(manifest$class == "dysplasia")))
+Held out of every fit: 17 dysplasia arrays
+> message("Provenance folded into the field state:")
+Provenance folded into the field state:
+> print(table(manifest$normal_provenance[manifest$continuum == "field"]))
+
+          adjacent      contralateral matched-unresolved 
+                41                  6                 16 
+> 
+> # ------------------------------------------------------------------------------
+> # Stability selection, binomial or multinomial
+> # ------------------------------------------------------------------------------
+> run_stability <- function(X, y, family, n_boot = N_BOOT) {
++   genes <- colnames(X)
++ 
++   boot_one <- function(b) {
++     idx <- unlist(lapply(levels(y), function(lev) {
++       i <- which(y == lev); if (!length(i)) return(integer(0))
++       sample(i, length(i), replace = TRUE)
++     }))
++     Xb <- X[idx, , drop = FALSE]; yb <- droplevels(y[idx])
++     if (nlevels(yb) < 2) return(NULL)
++ 
++     fold <- rep(NA_integer_, length(yb))
++     for (lev in levels(yb)) {
++       li <- which(yb == lev)
++       fold[li] <- sample(rep(seq_len(N_FOLDS), length.out = length(li)))
++     }
++     fit <- tryCatch(cv.glmnet(Xb, yb, family = family, alpha = ALPHA,
++                               type.measure = "class", foldid = fold),
++                     error = function(e) NULL)
++     if (is.null(fit)) return(NULL)
++     co <- coef(fit, s = "lambda.1se")
++     sel <- if (is.list(co))
++       unique(unlist(lapply(co, function(m) rownames(m)[which(as.numeric(m) != 0)])))
++     else rownames(co)[which(co[, 1] != 0)]
++     setdiff(sel, "(Intercept)")
++   }
++ 
++   res <- if (N_WORKERS <= 1L) {
++     lapply(seq_len(n_boot), boot_one)
++   } else if (.Platform$OS.type == "windows") {
++     cl <- parallel::makeCluster(N_WORKERS)
++     on.exit(parallel::stopCluster(cl), add = TRUE)
++     parallel::clusterEvalQ(cl, suppressPackageStartupMessages(library(glmnet)))
++     parallel::clusterExport(cl, c("X", "y", "family"), envir = environment())
++     parallel::clusterExport(cl, c("ALPHA", "N_FOLDS"), envir = globalenv())
++     parallel::clusterSetRNGStream(cl, 123)
++     parallel::parLapply(cl, seq_len(n_boot), boot_one)
++   } else {
++     mclapply(seq_len(n_boot), boot_one, mc.cores = N_WORKERS, mc.set.seed = TRUE)
++   }
++ 
++   counts <- setNames(rep(0, length(genes)), genes)
++   eff <- sum(!vapply(res, is.null, logical(1)))
++   for (r in res) if (!is.null(r)) counts[r] <- counts[r] + 1
++   list(freq = counts / eff, effective = eff)
++ }
+> 
+> # Subset and outcome for one configuration
+> config_data <- function(cfg, samples, lab) {
++   if (cfg == "multinomial")
++     return(list(keep = rep(TRUE, length(samples)), y = lab, family = "multinomial"))
++   if (grepl("^ovr_", cfg)) {
++     target <- sub("^ovr_", "", cfg)
++     y <- factor(ifelse(lab == target, target, "rest"), levels = c("rest", target))
++     return(list(keep = rep(TRUE, length(samples)), y = y, family = "binomial"))
++   }
++   parts <- strsplit(sub("^pair_", "", cfg), "_")[[1]]
++   keep <- lab %in% parts
++   list(keep = keep, y = factor(as.character(lab[keep]), levels = parts),
++        family = "binomial")
++ }
+> 
+> # ------------------------------------------------------------------------------
+> # Run every configuration on every arm
+> # ------------------------------------------------------------------------------
+> all_freq <- list(); panels <- list(); summary_rows <- list()
+> 
+> for (arm in names(ARMS)) {
++   expr <- load_arm(arm)
++   samp <- intersect(manifest$sample[!is.na(manifest$continuum)], colnames(expr))
++   lab_all <- manifest$continuum[match(samp, manifest$sample)]
++ 
++   for (cfg in CONFIGS) {
++     run <- paste(cfg, arm, sep = "_")
++     cd <- config_data(cfg, samp, lab_all)
++     s <- samp[cd$keep]
++     y <- droplevels(cd$y)
++     if (nlevels(y) < 2) { message("\n", run, ": one class only, skipped"); next }
++ 
++     X <- t(expr[, s, drop = FALSE])
++     message(sprintf("\n===== %s =====", run))
++     message(sprintf("  %d arrays x %d genes | classes %s", nrow(X), ncol(X),
++                     paste(sprintf("%s=%d", levels(y), as.integer(table(y))), collapse = ", ")))
++ 
++     if (min(table(y)) < 20)
++       message("  smallest class under 20 arrays, treat this configuration as supportive")
++ 
++     t0 <- Sys.time()
++     st <- run_stability(X, y, cd$family)
++     message(sprintf("  %d of %d bootstraps usable, %.1f min", st$effective, N_BOOT,
++                     as.numeric(difftime(Sys.time(), t0, units = "mins"))))
++ 
++     stable <- names(st$freq)[st$freq >= PI_THRESH]
++     message(sprintf("  stable genes at pi >= %.2f: %d", PI_THRESH, length(stable)))
++     if (length(stable)) message("    ", paste(head(stable, 20), collapse = ", "),
++                                 if (length(stable) > 20) ", ..." else "")
++ 
++     all_freq[[run]] <- st$freq
++     panels[[run]] <- stable
++     summary_rows[[run]] <- data.frame(
++       run = run, config = cfg, arm = arm, n_arrays = nrow(X),
++       n_classes = nlevels(y), smallest_class = min(as.integer(table(y))),
++       n_stable = length(stable), effective_boots = st$effective)
++ 
++     write.csv(data.frame(gene = names(st$freq), pi = as.numeric(st$freq)),
++               file.path(res_dir, sprintf("continuum_%s.csv", run)), row.names = FALSE)
++   }
++ }
+
+===== multinomial_A =====
+  446 arrays x 18152 genes | classes donor=54, field=63, cancer=329
+  500 of 500 bootstraps usable, 71.4 min
+  stable genes at pi >= 0.90: 16
+    CAB39L, CD1C, CFAP251, COL1A1, COL4A1, COL4A2, CTHRC1, ENAH, GCHFR, MAGI1, MMP1, PADI1, PCDH20, SORCS1, TMEM184B, TNFRSF10B
+
+===== ovr_field_A =====
+  446 arrays x 18152 genes | classes rest=383, field=63
+  500 of 500 bootstraps usable, 20.1 min
+  stable genes at pi >= 0.90: 8
+    CD1C, IDNK, LGI1, MAGI1, PCDH20, RSPO1, SLC27A6, TMEM132C
+
+===== pair_donor_field_A =====
+  117 arrays x 18152 genes | classes donor=54, field=63
+  500 of 500 bootstraps usable, 18.6 min
+  stable genes at pi >= 0.90: 4
+    DARS1, ENAH, MAFG, NEAT1
+
+===== pair_field_cancer_A =====
+  392 arrays x 18152 genes | classes field=63, cancer=329
+  500 of 500 bootstraps usable, 18.2 min
+  stable genes at pi >= 0.90: 6
+    CD1C, SLC16A6, SLC27A6, SORCS1, TMEM132C, TMEM184B
+
+===== multinomial_B =====
+  446 arrays x 18152 genes | classes donor=54, field=63, cancer=329
+  500 of 500 bootstraps usable, 58.3 min
+  stable genes at pi >= 0.90: 5
+    COL1A1, COL4A2, KRT17, MMP1, SORCS1
+
+===== ovr_field_B =====
+  446 arrays x 18152 genes | classes rest=383, field=63
+  500 of 500 bootstraps usable, 24.4 min
+  stable genes at pi >= 0.90: 0
+
+===== pair_donor_field_B =====
+  117 arrays x 18152 genes | classes donor=54, field=63
+  500 of 500 bootstraps usable, 6.0 min
+  stable genes at pi >= 0.90: 1
+    MAGEA4
+
+===== pair_field_cancer_B =====
+  392 arrays x 18152 genes | classes field=63, cancer=329

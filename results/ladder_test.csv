@@ -1,0 +1,7 @@
+"arm","scope","n_tiers","tiers","n","jt_statistic","z","p_value","n_perm"
+"A","held-out only",4,"contralateral<adjacent<matched<dysplasia",80,1180,1.301,0.09759,10000
+"A","plus cancer",5,"contralateral<adjacent<matched<dysplasia<cancer",409,24817,11.103,9.999e-05,10000
+"B","held-out only",4,"contralateral<adjacent<matched<dysplasia",80,1132,0.871,0.1968,10000
+"B","plus cancer",5,"contralateral<adjacent<matched<dysplasia<cancer",409,24717.5,11.043,9.999e-05,10000
+"C","held-out only",4,"contralateral<adjacent<matched<dysplasia",80,1364.5,2.96,0.0017,10000
+"C","plus cancer",5,"contralateral<adjacent<matched<dysplasia<cancer",409,25544.5,12.032,9.999e-05,10000

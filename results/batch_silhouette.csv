@@ -1,0 +1,7 @@
+"arm","arm_label","label","n_groups","avg_silhouette","pc_variance_percent"
+"A","fRMA baseline","study",7,0.2645,72.7
+"A","fRMA baseline","class",3,-0.0611,72.7
+"B","ComBat mod = NULL","study",7,-0.1353,57.9
+"B","ComBat mod = NULL","class",3,0.0986,57.9
+"C","ComBat mod = ~class","study",7,-0.12,57.9
+"C","ComBat mod = ~class","class",3,0.1004,57.9

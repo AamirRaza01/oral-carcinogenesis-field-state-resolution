@@ -1,0 +1,7 @@
+"run","arm","set","n_arrays","n_cancer","n_normal","n_stable","effective_boots"
+"A_DONOR","A","DONOR",383,329,54,12,500
+"B_DONOR","B","DONOR",383,329,54,9,500
+"C_DONOR","C","DONOR",383,329,54,7,500
+"A_FULL","A","FULL",446,329,117,7,500
+"B_FULL","B","FULL",446,329,117,1,500
+"C_FULL","C","FULL",446,329,117,7,500

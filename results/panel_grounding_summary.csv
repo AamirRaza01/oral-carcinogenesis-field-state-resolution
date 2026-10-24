@@ -1,0 +1,4 @@
+"layer","stratum","n_tumors","n_pairs","n_significant","n_genes_responding","n_genes_tested","metric_type","median_effect","max_effect"
+"driver","all",304,195,16,12,15,"log2FC",0.562,1.679
+"driver","non_hypermutated",300,180,18,12,15,"log2FC",0.722,1.71
+"regulator","oral tumors",304,2955,1846,15,15,"Spearman_rho",0.27,0.757

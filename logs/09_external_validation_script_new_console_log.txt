@@ -1,0 +1,448 @@
+> getwd()
+[1] "E:/OralCancer_Research"
+> # ==============================================================================
+> # Script: 09_external_validation.R
+> # Purpose: Test the panels on an independent cohort that shares no samples and
+> #          no microarray platform with the compendium they were derived on.
+> #
+> # THE VALIDATION COHORT
+> #   GSE25099, titled "Expression data from 57 patients with oral cancer and 22
+> #   normal persons". Its normals are independent donors, stated in the series
+> #   title, which makes it the right comparison for a panel trained on donor
+> #   normals. The deposited platform is GPL5175, the Affymetrix Human Exon 1.0
+> #   ST Array, transcript (gene) version. The free-text summary on the GEO page
+> #   names the Human Gene 1.0 ST Array instead. GPL5175 is the accession the
+> #   series is filed under and is what the series matrix is indexed by, so the
+> #   annotation used here is GPL5175.
+> #
+> # WHY THE DIFFERENT PLATFORM IS USEFUL RATHER THAN A NUISANCE
+> #   Two platforms measure the same gene on different probe chemistry, so their
+> #   absolute values are not comparable and neither are their normalizations. A
+> #   panel that still works across that gap is carrying biological signal rather
+> #   than a property of one array design.
+> #
+> # HOW THE GAP IS CROSSED
+> #   Each sample is converted to within-sample gene ranks before anything is
+> #   fitted. A rank inside one array is unchanged by any transformation that
+> #   preserves order, so array offset, array scale and platform normalization all
+> #   drop out. Only the relative ordering of genes inside a sample survives, and
+> #   that is what the model sees on both sides. No batch correction is applied
+> #   here and none is needed.
+> #
+> #   Ranks are computed over all genes shared between the platforms and only then
+> #   subset to the panel, so a gene's rank means its position in the whole
+> #   transcriptome rather than its position among a handful of panel genes.
+> #
+> # WHY GENES ARE MATCHED ON ENTREZ ID AND NOT ON SYMBOL
+> #   The compendium symbols come from a current hgu133plus2.db build. The GPL5175
+> #   annotation table was deposited in 2007. HGNC has renamed genes in between,
+> #   so the same locus carries a different symbol on the two sides. Two of the
+> #   seven genes in the C_DONOR panel are affected. LINC02487 is LOC441178 in the
+> #   older annotation and CFAP251 is WDR66. Matching symbol strings would drop
+> #   both and would report the loss as an absent gene rather than as a rename.
+> #   Entrez Gene ID is stable across both annotation vintages, so the match runs
+> #   on Entrez. The compendium side takes its Entrez ID from the same probe that
+> #   step 03 chose for each symbol, so no alias guessing is involved.
+> #
+> # WHICH PANELS ARE TESTED
+> #   Both the stability panel from step 05 and the minimum panel from step 07,
+> #   for the run named in BEST_RUN. The minimum panel is small by construction,
+> #   so how much it loses relative to the stability panel is part of the result.
+> #
+> # INPUT   results/panel_for_ladder.txt, results/stability_panels.rds,
+> #         processed_data/shared_symbol_selection_map.csv, arm matrices, manifest
+> # OUTPUT  results/external_validation.csv, results/external_confusion.csv,
+> #         results/external_gene_coverage.csv, figures/external_<panel>_<arm>.pdf
+> # ==============================================================================
+> 
+> source("00_oral_common.R")
+Loaded 00_oral_common.R | base_dir = E:/OralCancer_Research
+> set.seed(42)
+> 
+> # The GPL5175 annotation table is large. R's default 60 second limit on
+> # download.file aborts the transfer part way through, which surfaces later as a
+> # platform table with no annotation columns.
+> options(timeout = 3600)
+> 
+> suppressPackageStartupMessages({
++   library(GEOquery); library(xgboost); library(pROC); library(ggplot2)
++   library(AnnotationDbi); library(hgu133plus2.db)
++ })
+> 
+> EXT_GSE    <- "GSE25099"
+> EXT_GPL    <- "GPL5175"
+> TRAIN_SET  <- "DONOR"
+> BEST_RUN   <- "C_DONOR"
+> N_MODELS   <- 50
+> 
+> # Sample counts stated in the series title, used to check the label rule below.
+> EXPECT_NORMAL <- 22
+> EXPECT_CANCER <- 57
+> 
+> manifest <- load_manifest()
+> ext_dir  <- file.path(base_dir, "external"); dir.create(ext_dir, showWarnings = FALSE)
+> 
+> # ------------------------------------------------------------------------------
+> # 1. Panels to test
+> # ------------------------------------------------------------------------------
+> panel_file <- file.path(res_dir, "panel_for_ladder.txt")
+> stab_file  <- file.path(res_dir, "stability_panels.rds")
+> if (!file.exists(panel_file)) stop("Run step 07 first; ", panel_file, " is missing.")
+> if (!file.exists(stab_file))  stop("Run step 05 first; ", stab_file, " is missing.")
+> 
+> panel_min <- readLines(panel_file); panel_min <- panel_min[nzchar(panel_min)]
+> stab_all  <- readRDS(stab_file)
+> if (!BEST_RUN %in% names(stab_all))
++   stop("BEST_RUN '", BEST_RUN, "' is not in stability_panels.rds. Available: ",
++        paste(names(stab_all), collapse = ", "))
+> panel_stable <- stab_all[[BEST_RUN]]
+> 
+> PANELS <- list(stable = panel_stable, minimum = panel_min)
+> for (nm in names(PANELS))
++   message(sprintf("Panel %-8s (%d): %s", nm, length(PANELS[[nm]]),
++                   paste(PANELS[[nm]], collapse = ", ")))
+Panel stable   (7): CFAP251, COL1A1, COL4A1, COL4A2, KRT17, LINC02487, MMP1
+Panel minimum  (2): MMP1, LINC02487
+> 
+> # ------------------------------------------------------------------------------
+> # 2. Fetch the validation cohort
+> # ------------------------------------------------------------------------------
+> # The submitter-normalized series matrix is used rather than the raw CEL files.
+> # Processing Exon ST arrays needs a large platform annotation package, and the
+> # rank transform below removes any dependence on how the submitter normalized,
+> # so the extra step would buy nothing.
+> message("\nDownloading ", EXT_GSE, " into ", ext_dir, " ...")
+
+Downloading GSE25099 into E:/OralCancer_Research/external ...
+> gse  <- getGEO(EXT_GSE, GSEMatrix = TRUE, getGPL = TRUE, destdir = ext_dir)
+Found 1 file(s)
+GSE25099_series_matrix.txt.gz
+Using locally cached version: E:/OralCancer_Research/external/GSE25099_series_matrix.txt.gz
+Using locally cached version of GPL5175 found here:
+E:/OralCancer_Research/external/GPL5175.soft.gz 
+> eset <- if (is.list(gse)) gse[[1]] else gse
+> ext_expr <- Biobase::exprs(eset)
+> pd <- Biobase::pData(eset)
+> message(sprintf("  %d probes x %d samples", nrow(ext_expr), ncol(ext_expr)))
+  17881 probes x 79 samples
+> 
+> if (max(ext_expr, na.rm = TRUE) > 100) {
++   message("  values look linear, applying log2")
++   ext_expr <- log2(ext_expr + 1)
++ }
+> 
+> # ------------------------------------------------------------------------------
+> # 3. Class labels
+> # ------------------------------------------------------------------------------
+> # GEO submitters do not use a fixed vocabulary, so the matched fields are
+> # printed alongside the assigned counts and the counts are checked against the
+> # numbers stated in the series title.
+> lab_cols <- grep("title|source_name|characteristics", names(pd), value = TRUE)
+> txt <- tolower(apply(pd[, lab_cols, drop = FALSE], 1, paste, collapse = " | "))
+> ext_class <- ifelse(grepl("normal|control|non-?tumor|healthy", txt), "normal",
++              ifelse(grepl("cancer|tumor|carcinoma|oscc", txt), "cancer", NA_character_))
+> tab <- table(ext_class, useNA = "ifany")
+> message("  class assignment: ",
++         paste(sprintf("%s=%d", names(tab), as.integer(tab)), collapse = ", "))
+  class assignment: cancer=57, normal=22
+> if (any(is.na(ext_class))) {
++   message("  Unlabelled samples, the matched text for the first few:")
++   print(head(unique(txt[is.na(ext_class)]), 5))
++ }
+> n_norm <- sum(ext_class == "normal", na.rm = TRUE)
+> n_canc <- sum(ext_class == "cancer", na.rm = TRUE)
+> if (n_norm != EXPECT_NORMAL || n_canc != EXPECT_CANCER)
++   warning(sprintf("Label rule gave %d normal and %d cancer, the series states %d and %d.",
++                   n_norm, n_canc, EXPECT_NORMAL, EXPECT_CANCER), call. = FALSE)
+> 
+> keep <- !is.na(ext_class)
+> ext_expr <- ext_expr[, keep, drop = FALSE]; ext_class <- ext_class[keep]
+> 
+> # ------------------------------------------------------------------------------
+> # 4. External probes to Entrez Gene ID
+> # ------------------------------------------------------------------------------
+> # GPL5175 stores annotation in gene_assignment, one or more records per probe
+> # separated by "///", each record holding accession, symbol, description, band
+> # and Entrez ID separated by "//". The first record is used.
+> fd <- Biobase::fData(eset)
+> ga_col <- grep("gene_assignment", names(fd), value = TRUE, ignore.case = TRUE)[1]
+> 
+> ext_entrez <- NULL; ext_symbol <- NULL
+> if (!is.na(ga_col)) {
++   first_rec <- trimws(sapply(strsplit(as.character(fd[[ga_col]]), "///", fixed = TRUE), `[`, 1))
++   parts <- strsplit(first_rec, "//", fixed = TRUE)
++   ext_entrez <- trimws(sapply(parts, function(p) if (length(p) >= 5) p[5] else NA_character_))
++   ext_symbol <- trimws(sapply(parts, function(p) if (length(p) >= 2) p[2] else NA_character_))
++   ext_entrez[!grepl("^[0-9]+$", ext_entrez)] <- NA
++   ext_symbol[!nzchar(ext_symbol)] <- NA
++   names(ext_entrez) <- names(ext_symbol) <- rownames(fd)
++   message(sprintf("  Entrez IDs parsed from %s for %d of %d probes",
++                   ga_col, sum(!is.na(ext_entrez)), length(ext_entrez)))
++ }
+  Entrez IDs parsed from gene_assignment for 17634 of 17881 probes
+> 
+> # Fall back to the transcript cluster annotation package when the platform table
+> # did not come through with the series.
+> if (is.null(ext_entrez) || sum(!is.na(ext_entrez)) < 1000) {
++   if (!requireNamespace("huex10sttranscriptcluster.db", quietly = TRUE))
++     stop("The platform table carried no usable annotation and the fallback ",
++          "package is absent. Install it with\n",
++          '  BiocManager::install("huex10sttranscriptcluster.db")\n',
++          "then rerun this script. Columns present in the platform table: ",
++          paste(names(fd), collapse = ", "))
++   message("  Platform table unusable, falling back to huex10sttranscriptcluster.db")
++   db <- huex10sttranscriptcluster.db::huex10sttranscriptcluster.db
++   ext_entrez <- AnnotationDbi::mapIds(db, keys = rownames(ext_expr), column = "ENTREZID",
++                                       keytype = "PROBEID", multiVals = "first")
++   ext_symbol <- AnnotationDbi::mapIds(db, keys = rownames(ext_expr), column = "SYMBOL",
++                                       keytype = "PROBEID", multiVals = "first")
++   message(sprintf("  Entrez IDs mapped for %d of %d probes",
++                   sum(!is.na(ext_entrez)), length(ext_entrez)))
++ }
+> 
+> ext_entrez <- ext_entrez[rownames(ext_expr)]
+> ext_symbol <- ext_symbol[rownames(ext_expr)]
+> ok <- !is.na(ext_entrez)
+> ext_expr <- ext_expr[ok, , drop = FALSE]
+> ext_entrez <- ext_entrez[ok]; ext_symbol <- ext_symbol[ok]
+> 
+> # One probe per Entrez ID, the highest mean, matching how step 03 collapsed
+> pm <- rowMeans(ext_expr, na.rm = TRUE)
+> pick <- vapply(split(seq_along(ext_entrez), ext_entrez),
++                function(ix) if (length(ix) == 1L) ix else ix[which.max(pm[ix])], integer(1))
+> ext_by_entrez <- ext_expr[pick, , drop = FALSE]
+> rownames(ext_by_entrez) <- names(pick)
+> ext_sym_of_entrez <- setNames(ext_symbol[pick], names(pick))
+> all_ext_symbols <- unique(na.omit(ext_symbol))
+> message(sprintf("  collapsed to %d Entrez IDs", nrow(ext_by_entrez)))
+  collapsed to 17324 Entrez IDs
+> 
+> # ------------------------------------------------------------------------------
+> # 5. Compendium symbols to Entrez Gene ID
+> # ------------------------------------------------------------------------------
+> # The Entrez ID is taken from the probe step 03 selected for each symbol, so the
+> # mapping uses the same annotation build that produced the symbols.
+> map_file <- file.path(out_dir, "shared_symbol_selection_map.csv")
+> if (!file.exists(map_file)) stop("Run step 03 first; ", map_file, " is missing.")
+> sel <- read.csv(map_file, stringsAsFactors = FALSE)
+> sel$entrez <- AnnotationDbi::mapIds(hgu133plus2.db, keys = sel$probe_id,
++                                     column = "ENTREZID", keytype = "PROBEID",
++                                     multiVals = "first")
+'select()' returned 1:many mapping between keys and columns
+> sel <- sel[!is.na(sel$entrez) & !duplicated(sel$entrez), ]
+> sym_of_entrez <- setNames(sel$gene_symbol, sel$entrez)
+> entrez_of_sym <- setNames(sel$entrez, sel$gene_symbol)
+> message(sprintf("  compendium: %d of %d symbols carry an Entrez ID",
++                 nrow(sel), nrow(read.csv(map_file, stringsAsFactors = FALSE))))
+  compendium: 18152 of 18152 symbols carry an Entrez ID
+> 
+> # Re-key the external matrix to compendium symbols so both sides share row names
+> shared_entrez <- intersect(rownames(ext_by_entrez), names(sym_of_entrez))
+> ext_gene <- ext_by_entrez[shared_entrez, , drop = FALSE]
+> rownames(ext_gene) <- sym_of_entrez[shared_entrez]
+> message(sprintf("  genes shared across platforms after Entrez matching: %d", nrow(ext_gene)))
+  genes shared across platforms after Entrez matching: 14977
+> 
+> # ------------------------------------------------------------------------------
+> # 6. Panel coverage, reported gene by gene
+> # ------------------------------------------------------------------------------
+> # on_external_platform is the Entrez match that the script relies on.
+> # symbol_match records whether matching the symbol string alone would have found
+> # the same gene, so a rename between the two annotation vintages is visible as
+> # on_external_platform TRUE with symbol_match FALSE.
+> cov_rows <- list()
+> for (pn in names(PANELS)) {
++   for (g in PANELS[[pn]]) {
++     e <- entrez_of_sym[g]
++     hit <- !is.na(e) && e %in% rownames(ext_by_entrez)
++     cov_rows[[length(cov_rows) + 1]] <- data.frame(
++       panel = pn, gene = g,
++       entrez = if (is.na(e)) NA_character_ else unname(e),
++       on_external_platform = hit,
++       external_symbol = if (hit) unname(ext_sym_of_entrez[[unname(e)]]) else NA_character_,
++       symbol_match = g %in% all_ext_symbols)
++   }
++ }
+> coverage <- do.call(rbind, cov_rows)
+> write.csv(coverage, file.path(res_dir, "external_gene_coverage.csv"), row.names = FALSE)
+> message("\n===== Panel coverage on ", EXT_GPL, " =====")
+
+===== Panel coverage on GPL5175 =====
+> print(coverage, row.names = FALSE)
+   panel      gene entrez on_external_platform external_symbol symbol_match
+  stable   CFAP251 144406                 TRUE           WDR66        FALSE
+  stable    COL1A1   1277                 TRUE          COL1A1         TRUE
+  stable    COL4A1   1282                 TRUE          COL4A1         TRUE
+  stable    COL4A2   1284                 TRUE          COL4A2         TRUE
+  stable     KRT17   3872                 TRUE           KRT17         TRUE
+  stable LINC02487 441178                FALSE            <NA>        FALSE
+  stable      MMP1   4312                 TRUE            MMP1         TRUE
+ minimum      MMP1   4312                 TRUE            MMP1         TRUE
+ minimum LINC02487 441178                FALSE            <NA>        FALSE
+> 
+> # ------------------------------------------------------------------------------
+> # 7. Rank transform and transfer, per panel and per arm
+> # ------------------------------------------------------------------------------
+> rank_within_sample <- function(M) apply(M, 2, function(x) rank(x, na.last = "keep") / sum(!is.na(x)))
+> 
+> res_rows <- list(); cm_rows <- list()
+> 
+> for (arm in names(ARMS)) {
++   expr   <- load_arm(arm)
++   common <- intersect(rownames(expr), rownames(ext_gene))
++   message("\n===== Arm ", arm, " (", ARM_LABEL[[arm]], "), ",
++           length(common), " genes shared =====")
++ 
++   disc_rank <- rank_within_sample(expr[common, , drop = FALSE])
++   ext_rank  <- rank_within_sample(ext_gene[common, , drop = FALSE])
++ 
++   train_samp <- intersect(set_samples(manifest, TRAIN_SET), colnames(expr))
++   y_train <- set_labels(manifest, train_samp)
++   yb <- as.integer(y_train == "cancer")
++   y_ext <- as.integer(ext_class == "cancer")
++ 
++   for (pn in names(PANELS)) {
++     genes <- intersect(PANELS[[pn]], common)
++     if (!length(genes)) {
++       message("  panel ", pn, ": no panel gene is on both platforms, skipping"); next
++     }
++     if (length(genes) == 1L)
++       message("  panel ", pn, ": only one gene transfers, the result below is a ",
++               "single-gene test and not a panel test")
++     message(sprintf("  panel %-8s %d of %d genes transfer: %s",
++                     pn, length(genes), length(PANELS[[pn]]), paste(genes, collapse = ", ")))
++ 
++     X_train <- t(disc_rank[genes, train_samp, drop = FALSE])
++     X_ext   <- t(ext_rank[genes, , drop = FALSE])
++ 
++     preds <- matrix(NA_real_, nrow(X_ext), N_MODELS); ths <- rep(NA_real_, N_MODELS)
++     for (m in seq_len(N_MODELS)) {
++       sp  <- stratified_split(y_train)
++       dtr <- xgb.DMatrix(X_train[sp$train, , drop = FALSE], label = yb[sp$train])
++       dvl <- xgb.DMatrix(X_train[sp$val,   , drop = FALSE], label = yb[sp$val])
++       fit <- tryCatch(xgb.train(list(objective = "binary:logistic", eval_metric = "logloss",
++                                      max_depth = 4, eta = 0.1, subsample = 0.8,
++                                      colsample_bytree = 1, nthread = 1),
++                                 dtr, nrounds = 400, evals = list(val = dvl),
++                                 early_stopping_rounds = 20, verbose = 0),
++                       error = function(e) NULL)
++       if (is.null(fit)) next
++       preds[, m] <- predict(fit, xgb.DMatrix(X_ext))
++       pv <- predict(fit, dvl)
++       r  <- tryCatch(roc(yb[sp$val], pv, quiet = TRUE), error = function(e) NULL)
++       ths[m] <- if (is.null(r)) 0.5 else
++         r$thresholds[which.max(r$sensitivities + r$specificities - 1)]
++     }
++     if (all(is.na(preds))) { message("  panel ", pn, ": every fit failed, skipping"); next }
++ 
++     p_ext <- rowMeans(preds, na.rm = TRUE)
++     th <- median(ths[is.finite(ths)], na.rm = TRUE); if (!is.finite(th)) th <- 0.5
++ 
++     auc <- as.numeric(roc(y_ext, p_ext, quiet = TRUE)$auc)
++     pred_cls <- ifelse(p_ext > th, "cancer", "normal")
++     cm <- table(True = factor(ext_class, levels = c("normal", "cancer")),
++                 Predicted = factor(pred_cls, levels = c("normal", "cancer")))
++     sens <- cm["cancer", "cancer"] / sum(cm["cancer", ])
++     spec <- cm["normal", "normal"] / sum(cm["normal", ])
++     message(sprintf("    external AUC %.4f | sensitivity %.3f | specificity %.3f | threshold %.3f",
++                     auc, sens, spec, th))
++     print(cm)
++ 
++     key <- paste(pn, arm, sep = "_")
++     res_rows[[key]] <- data.frame(
++       panel = pn, arm = arm, arm_label = ARM_LABEL[[arm]],
++       n_panel_genes = length(PANELS[[pn]]), n_transferred = length(genes),
++       n_external = length(y_ext), auc = round(auc, 4),
++       sensitivity = round(sens, 3), specificity = round(spec, 3), threshold = round(th, 3))
++     cm_rows[[key]] <- data.frame(panel = pn, arm = arm, as.data.frame(cm))
++ 
++     df <- data.frame(score = p_ext, class = ext_class)
++     p <- ggplot(df, aes(class, score, fill = class)) +
++       geom_boxplot(outlier.shape = NA, alpha = 0.85, width = 0.5) +
++       geom_jitter(width = 0.15, size = 1.2, alpha = 0.6) +
++       geom_hline(yintercept = th, linetype = "dashed", color = "red") +
++       labs(title = paste0("External validation on ", EXT_GSE, ", Arm ", arm),
++            subtitle = sprintf("%s | %s panel, %d of %d genes | rank transfer | AUC %.3f",
++                               ARM_LABEL[[arm]], pn, length(genes), length(PANELS[[pn]]), auc),
++            x = NULL, y = "Predicted cancer score") +
++       theme_minimal(base_size = 11) +
++       theme(legend.position = "none", plot.title = element_text(face = "plain"))
++     ggsave(file.path(fig_dir, sprintf("external_%s_%s.pdf", pn, arm)), p, width = 6.5, height = 5)
++     ggsave(file.path(fig_dir, sprintf("external_%s_%s.png", pn, arm)), p, width = 6.5, height = 5, dpi = 300)
++   }
++ }
+
+===== Arm A (fRMA baseline), 14977 genes shared =====
+  panel stable   6 of 7 genes transfer: CFAP251, COL1A1, COL4A1, COL4A2, KRT17, MMP1
+    external AUC 0.9880 | sensitivity 0.982 | specificity 0.773 | threshold 0.691
+        Predicted
+True     normal cancer
+  normal     17      5
+  cancer      1     56
+  panel minimum: only one gene transfers, the result below is a single-gene test and not a panel test
+  panel minimum  1 of 2 genes transfer: MMP1
+    external AUC 0.9992 | sensitivity 1.000 | specificity 0.773 | threshold 0.697
+        Predicted
+True     normal cancer
+  normal     17      5
+  cancer      0     57
+
+===== Arm B (ComBat mod = NULL), 14977 genes shared =====
+  panel stable   6 of 7 genes transfer: CFAP251, COL1A1, COL4A1, COL4A2, KRT17, MMP1
+    external AUC 0.9817 | sensitivity 1.000 | specificity 0.636 | threshold 0.650
+        Predicted
+True     normal cancer
+  normal     14      8
+  cancer      0     57
+  panel minimum: only one gene transfers, the result below is a single-gene test and not a panel test
+  panel minimum  1 of 2 genes transfer: MMP1
+    external AUC 0.9992 | sensitivity 1.000 | specificity 0.818 | threshold 0.661
+        Predicted
+True     normal cancer
+  normal     18      4
+  cancer      0     57
+
+===== Arm C (ComBat mod = ~class), 14977 genes shared =====
+  panel stable   6 of 7 genes transfer: CFAP251, COL1A1, COL4A1, COL4A2, KRT17, MMP1
+    external AUC 0.9809 | sensitivity 1.000 | specificity 0.545 | threshold 0.575
+        Predicted
+True     normal cancer
+  normal     12     10
+  cancer      0     57
+  panel minimum: only one gene transfers, the result below is a single-gene test and not a panel test
+  panel minimum  1 of 2 genes transfer: MMP1
+    external AUC 0.9984 | sensitivity 1.000 | specificity 0.773 | threshold 0.510
+        Predicted
+True     normal cancer
+  normal     17      5
+  cancer      0     57
+> 
+> if (length(res_rows)) {
++   out <- do.call(rbind, res_rows)
++   out <- out[order(out$panel, -out$auc), ]
++   write.csv(out, file.path(res_dir, "external_validation.csv"), row.names = FALSE)
++   write.csv(do.call(rbind, cm_rows), file.path(res_dir, "external_confusion.csv"), row.names = FALSE)
++   message("\n===== External validation across panels and arms =====")
++   print(out, row.names = FALSE)
++ } else {
++   message("\nNo panel produced an external result. external_gene_coverage.csv records why.")
++ }
+
+===== External validation across panels and arms =====
+   panel arm           arm_label n_panel_genes n_transferred n_external    auc sensitivity specificity
+ minimum   A       fRMA baseline             2             1         79 0.9992       1.000       0.773
+ minimum   B   ComBat mod = NULL             2             1         79 0.9992       1.000       0.818
+ minimum   C ComBat mod = ~class             2             1         79 0.9984       1.000       0.773
+  stable   A       fRMA baseline             7             6         79 0.9880       0.982       0.773
+  stable   B   ComBat mod = NULL             7             6         79 0.9817       1.000       0.636
+  stable   C ComBat mod = ~class             7             6         79 0.9809       1.000       0.545
+ threshold
+     0.697
+     0.661
+     0.510
+     0.691
+     0.650
+     0.575
+> message("\n>>> STEP 9 COMPLETE. Results in ", res_dir)
+
+>>> STEP 9 COMPLETE. Results in E:/OralCancer_Research/results

@@ -1,0 +1,4 @@
+"layer","stratum","n_tumors","n_pairs","observed_share","null_mean","null_p95","p_value"
+"driver","all",304,195,0.0821,0.0527,0.1077,0.1978
+"driver","non_hypermutated",300,180,0.1,0.0649,0.1278,0.1838
+"regulator","oral tumors",304,2955,0.6247,0.5561,0.629,0.06468

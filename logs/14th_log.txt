@@ -1,0 +1,357 @@
+Loaded 00_oral_common.R | base_dir = E:/OralCancer_Research
+> set.seed(42)
+> 
+> suppressPackageStartupMessages({ library(data.table) })
+> 
+> TCGA_DIR   <- file.path(base_dir, "tcga_hnsc")
+> PANEL_FILE <- file.path(res_dir, "continuum_multinomial_A.txt")  # step 12 output
+> MIN_GROUP  <- 5      # smallest mutant or wildtype group admitted to a test
+> N_NULL     <- 1000
+> FDR        <- 0.05
+> HYPERMUT   <- 500    # somatic mutations above which a tumor is called hypermutated
+> 
+> DRIVERS_PUBLISHED <- c("TP53", "CDKN2A", "PIK3CA", "NOTCH1", "CASP8", "HRAS",
++                        "FAT1", "AJUBA", "NSD1", "NFE2L2", "TRAF3")
+> 
+> DRIVER_SOURCE    <- "union"   # "published", "oncodrive", or "union"
+> ONCODRIVE_FDR    <- 0.1
+> ONCODRIVE_MINMUT <- 5
+> 
+> read_lines_clean <- function(f) { x <- readLines(f); x[nzchar(x)] }
+> 
+> if (!file.exists(PANEL_FILE)) stop("Run step 12 first; ", PANEL_FILE, " is missing.")
+> panel <- read_lines_clean(PANEL_FILE)
+> message("Panel: ", length(panel), " genes")
+Panel: 16 genes
+> 
+> # ------------------------------------------------------------------------------
+> # 1. Expression and phenotype, restricted to oral cavity tumors
+> # ------------------------------------------------------------------------------
+> expr_file  <- file.path(TCGA_DIR, "hnsc_tmm_log2cpm_by_symbol.csv")
+> pheno_file <- file.path(TCGA_DIR, "hnsc_pheno.csv")
+> oral_file  <- file.path(TCGA_DIR, "hnsc_oral_cavity_samples.txt")
+> for (f in c(expr_file, pheno_file)) if (!file.exists(f)) stop("Missing ", f)
+> 
+> E <- as.matrix(fread(expr_file), rownames = 1)
+> ph <- fread(pheno_file)
+> oral <- if (file.exists(oral_file)) read_lines_clean(oral_file) else
++   ph$sample_barcode[ph$hnsc_site == "Oral cavity"]
+> 
+> tum <- intersect(colnames(E), ph$sample_barcode[grepl("Tumor", ph$sample_type)])
+> tum <- intersect(tum, oral)
+> message(sprintf("oral cavity tumors with expression: %d", length(tum)))
+oral cavity tumors with expression: 309
+> E <- E[, tum, drop = FALSE]
+> 
+> # ------------------------------------------------------------------------------
+> # 2. Somatic mutations from the MC3 cohort
+> # ------------------------------------------------------------------------------
+> maf_dt <- NULL
+> if (requireNamespace("TCGAmutations", quietly = TRUE)) {
++   message("Loading the MC3 mutation cohort for TCGA-HNSC ...")
++   hnsc_maf <- TCGAmutations::tcga_load(study = "HNSC")
++   maf_dt <- data.table::as.data.table(hnsc_maf@data)
++ } else {
++   f <- Sys.glob(file.path(TCGA_DIR, "*maf*"))[1]
++   if (is.na(f)) stop(
++     "TCGAmutations is absent and no MAF file sits in ", TCGA_DIR, ". Install with\n",
++     '  BiocManager::install("PoisonAlien/TCGAmutations")')
++   message("TCGAmutations absent, reading ", f)
++   maf_dt <- fread(f)
++ }
+Loading the MC3 mutation cohort for TCGA-HNSC ...
+Loading HNSC. Please cite: https://doi.org/10.1016/j.cels.2018.03.002 for reference
+> 
+> maf <- maf_dt[Variant_Classification != "Silent"]
+> BARCODE_N <- 15
+> maf[, sample := substr(Tumor_Sample_Barcode, 1, BARCODE_N)]
+> colnames(E) <- substr(colnames(E), 1, BARCODE_N)
+> E <- E[, !duplicated(colnames(E)), drop = FALSE]
+> maf <- maf[sample %in% colnames(E)]
+> message(sprintf("mutation calls on %d of the %d oral tumors",
++                 uniqueN(maf$sample), ncol(E)))
+mutation calls on 304 of the 309 oral tumors
+> 
+> E <- E[, colnames(E) %in% unique(maf$sample), drop = FALSE]
+> message(sprintf("tumors carried into the tests: %d", ncol(E)))
+tumors carried into the tests: 304
+> 
+> tmb <- maf[, .N, by = sample]
+> hyper <- tmb$sample[tmb$N > HYPERMUT]
+> message(sprintf("hypermutated tumors above %d calls: %d", HYPERMUT, length(hyper)))
+hypermutated tumors above 500 calls: 4
+> 
+> mut_status <- function(gene) colnames(E) %in% unique(maf$sample[maf$Hugo_Symbol == gene])
+> 
+> # ------------------------------------------------------------------------------
+> # 2b. Driver detection on the oral cavity subset with OncodriveCLUST
+> # ------------------------------------------------------------------------------
+> DRIVERS_ONCODRIVE <- character(0)
+> if (!exists("hnsc_maf")) {
++   message("\nNo maftools object available, OncodriveCLUST skipped.")
++ } else if (!requireNamespace("maftools", quietly = TRUE)) {
++   message("\nmaftools absent, OncodriveCLUST skipped.")
++ } else {
++   oral_tsb <- unique(maf_dt$Tumor_Sample_Barcode[
++     substr(maf_dt$Tumor_Sample_Barcode, 1, BARCODE_N) %in% colnames(E)])
++   message(sprintf("\nRunning OncodriveCLUST on %d oral cavity tumors ...", length(oral_tsb)))
++   oral_maf <- maftools::subsetMaf(hnsc_maf, tsb = oral_tsb, mafObj = TRUE)
++   
++   aacol <- intersect(c("HGVSp_Short", "Protein_Change", "amino_acid_change", "AAChange"),
++                      names(maf_dt))[1]
++   od <- tryCatch(maftools::oncodrive(maf = oral_maf, AACol = aacol,
++                                      minMut = ONCODRIVE_MINMUT, pvalMethod = "zscore"),
++                  error = function(e) { message("  OncodriveCLUST failed: ", conditionMessage(e)); NULL })
++   
++   if (!is.null(od)) {
++     od <- data.table::as.data.table(od)
++     write.csv(od, file.path(res_dir, "oncodrive_oral.csv"), row.names = FALSE)
++     DRIVERS_ONCODRIVE <- od$Hugo_Symbol[od$fdr < ONCODRIVE_FDR]
++     message(sprintf("  genes at FDR < %.2f: %d", ONCODRIVE_FDR, length(DRIVERS_ONCODRIVE)))
++     
++     # Save both PDF and 300 DPI PNG
++     pdf(file.path(fig_dir, "oncodrive_oral.pdf"), width = 6, height = 5)
++     try(maftools::plotOncodrive(res = od, fdrCutOff = ONCODRIVE_FDR, useFraction = TRUE), silent = TRUE)
++     dev.off()
++     
++     png(file.path(fig_dir, "oncodrive_oral.png"), width = 6, height = 5, units = "in", res = 300)
++     try(maftools::plotOncodrive(res = od, fdrCutOff = ONCODRIVE_FDR, useFraction = TRUE), silent = TRUE)
++     dev.off()
++   }
++ }
+
+Running OncodriveCLUST on 304 oral cavity tumors ...
+--Possible FLAGS among top ten genes:
+  TTN
+  MUC16
+  SYNE1
+-Processing clinical data
+Estimating background scores from synonymous variants..
+  |==============================================================================================================| 100%
+Not enough genes to build background. Using predefined values. (Mean = 0.279; SD = 0.13)
+Estimating cluster scores from non-syn variants..
+  |==============================================================================================================| 100%
+Comapring with background model and estimating p-values..
+Done !
+  genes at FDR < 0.10: 7
+null device 
+          1 
+Warning message:
+In maftools::oncodrive(maf = oral_maf, AACol = aacol, minMut = ONCODRIVE_MINMUT,  :
+  Oncodrive has been superseeded by OncodriveCLUSTL. See http://bg.upf.edu/group/projects/oncodrive-clust.php
+> 
+> DRIVERS <- switch(DRIVER_SOURCE,
++                   published = DRIVERS_PUBLISHED,
++                   oncodrive = DRIVERS_ONCODRIVE,
++                   union     = union(DRIVERS_PUBLISHED, DRIVERS_ONCODRIVE))
+> DRIVERS <- DRIVERS[DRIVERS %in% unique(maf$Hugo_Symbol)]
+> message(sprintf("\nDriver set in use (%s): %d genes", DRIVER_SOURCE, length(DRIVERS)))
+
+Driver set in use (union): 15 genes
+> 
+> # ------------------------------------------------------------------------------
+> # 3. Identity. Panel genes are rarely mutated
+> # ------------------------------------------------------------------------------
+> freq <- data.frame(gene = panel,
++                    n_mutated = vapply(panel, function(g) sum(mut_status(g)), integer(1)),
++                    n_tumors = ncol(E))
+> freq$percent <- round(100 * freq$n_mutated / freq$n_tumors, 2)
+> write.csv(freq, file.path(res_dir, "panel_mutation_frequency.csv"), row.names = FALSE)
+> message("\n===== Panel gene mutation frequency in oral cavity tumors =====")
+
+===== Panel gene mutation frequency in oral cavity tumors =====
+> print(freq, row.names = FALSE)
+      gene n_mutated n_tumors percent
+    CAB39L         1      304    0.33
+      CD1C         1      304    0.33
+   CFAP251         0      304    0.00
+    COL1A1         2      304    0.66
+    COL4A1         5      304    1.64
+    COL4A2         5      304    1.64
+    CTHRC1         0      304    0.00
+      ENAH         1      304    0.33
+     GCHFR         1      304    0.33
+     MAGI1         3      304    0.99
+      MMP1         3      304    0.99
+     PADI1         2      304    0.66
+    PCDH20         7      304    2.30
+    SORCS1         8      304    2.63
+  TMEM184B         1      304    0.33
+ TNFRSF10B         1      304    0.33
+> 
+> drv_freq <- data.frame(driver = DRIVERS,
++                        n_mutated = vapply(DRIVERS, function(g) sum(mut_status(g)), integer(1)))
+> drv_freq$percent <- round(100 * drv_freq$n_mutated / ncol(E), 1)
+> drv_freq$testable <- drv_freq$n_mutated >= MIN_GROUP &
++   (ncol(E) - drv_freq$n_mutated) >= MIN_GROUP
+> write.csv(drv_freq, file.path(res_dir, "driver_mutation_frequency.csv"), row.names = FALSE)
+> 
+> # ------------------------------------------------------------------------------
+> # 4. Response. Panel expression against driver mutation status
+> # ------------------------------------------------------------------------------
+> test_set <- function(genes, samples, label) {
++   Es <- E[intersect(genes, rownames(E)), samples, drop = FALSE]
++   rows <- list()
++   for (d in DRIVERS) {
++     mstat <- colnames(E) %in% unique(maf$sample[maf$Hugo_Symbol == d])
++     names(mstat) <- colnames(E)
++     m <- mstat[samples]
++     if (sum(m) < MIN_GROUP || sum(!m) < MIN_GROUP) next
++     for (g in rownames(Es)) {
++       a <- Es[g, m]; b <- Es[g, !m]
++       w <- suppressWarnings(wilcox.test(a, b))
++       rows[[length(rows) + 1]] <- data.frame(
++         stratum = label, gene = g, driver = d,
++         n_mutant = sum(m), n_wildtype = sum(!m),
++         log2fc = round(mean(a) - mean(b), 4), p_value = w$p.value)
++     }
++   }
++   if (!length(rows)) return(NULL)
++   out <- do.call(rbind, rows)
++   out$p_adj <- p.adjust(out$p_value, method = "BH")
++   out
++ }
+> 
+> strata <- list(all = colnames(E), non_hypermutated = setdiff(colnames(E), hyper))
+> pair_rows <- list(); driver_summary_rows <- list(); unified_summary_rows <- list()
+> 
+> panel_in <- intersect(panel, rownames(E))
+> 
+> for (nm in names(strata)) {
++   s <- strata[[nm]]
++   if (length(s) < 2 * MIN_GROUP) next
++   obs <- test_set(panel_in, s, nm)
++   if (is.null(obs)) next
++   hit <- mean(obs$p_adj < FDR)
++   message(sprintf("\n===== stratum %s, %d tumors =====", nm, length(s)))
++   message(sprintf("  %d testable pairs, %d significant at BH %.2f (%.1f percent)",
++                   nrow(obs), sum(obs$p_adj < FDR), FDR, 100 * hit))
++   pair_rows[[nm]] <- obs
++   
++   sig <- obs[obs$p_adj < FDR, ]
++   n_genes_resp <- length(unique(sig$gene))
++   message(sprintf("  panel genes responding to at least one driver: %d of %d",
++                   n_genes_resp, length(unique(obs$gene))))
++   
++   driver_summary_rows[[nm]] <- data.frame(
++     stratum = nm, n_tumors = length(s), n_pairs = nrow(obs),
++     n_significant = nrow(sig), n_genes_responding = n_genes_resp,
++     n_genes_tested = length(unique(obs$gene)),
++     median_abs_log2fc = round(median(abs(sig$log2fc)), 3),
++     max_abs_log2fc = round(max(abs(sig$log2fc)), 3))
++   
++   unified_summary_rows[[paste0("driver_", nm)]] <- data.frame(
++     layer = "driver", stratum = nm, n_tumors = length(s), n_pairs = nrow(obs),
++     n_significant = nrow(sig), n_genes_responding = n_genes_resp,
++     n_genes_tested = length(unique(obs$gene)),
++     metric_type = "log2FC",
++     median_effect = round(median(abs(sig$log2fc)), 3),
++     max_effect = round(max(abs(sig$log2fc)), 3))
++ }
+
+===== stratum all, 304 tumors =====
+  195 testable pairs, 16 significant at BH 0.05 (8.2 percent)
+  panel genes responding to at least one driver: 12 of 15
+
+===== stratum non_hypermutated, 300 tumors =====
+  180 testable pairs, 18 significant at BH 0.05 (10.0 percent)
+  panel genes responding to at least one driver: 12 of 15
+> 
+> if (length(pair_rows))
++   write.csv(do.call(rbind, pair_rows), file.path(res_dir, "panel_driver_pairs.csv"),
++             row.names = FALSE)
+> 
+> # ------------------------------------------------------------------------------
+> # 5. Regulation. Panel expression against inferred transcription factor activity
+> # ------------------------------------------------------------------------------
+> tf_ok <- requireNamespace("viper", quietly = TRUE) &&
++   requireNamespace("dorothea", quietly = TRUE)
+> if (tf_ok) {
++   reg <- dorothea::dorothea_hs
++   reg <- reg[reg$confidence %in% c("A", "B", "C"), ]
++   regulons <- split(reg, reg$tf)
++   regulons <- regulons[vapply(regulons, nrow, integer(1)) >= 20]
++   vip <- viper::viper(E, lapply(regulons, function(r)
++     list(tfmode = setNames(r$mor, r$target), likelihood = rep(1, nrow(r)))),
++     method = "scale", minsize = 20, verbose = FALSE)
++   message(sprintf("\nregulator activity inferred for %d transcription factors", nrow(vip)))
++   
++   tf_test <- function(genes) {
++     rows <- list()
++     for (g in intersect(genes, rownames(E))) for (tf in rownames(vip)) {
++       ct <- suppressWarnings(cor.test(E[g, ], vip[tf, ], method = "spearman"))
++       rows[[length(rows) + 1]] <- data.frame(gene = g, tf = tf,
++                                              rho = round(unname(ct$estimate), 4),
++                                              p_value = ct$p.value)
++     }
++     out <- do.call(rbind, rows)
++     out$p_adj <- p.adjust(out$p_value, method = "BH")
++     out
++   }
++   
++   obs <- tf_test(panel_in)
++   sig <- obs[obs$p_adj < FDR, ]
++   strong <- sig[abs(sig$rho) >= 0.4, ]
++   message(sprintf("  %d gene and regulator pairs, %d significant, |rho| median %.2f",
++                   nrow(obs), nrow(sig), median(abs(sig$rho))))
++   message(sprintf("  pairs at |rho| of at least 0.4: %d, over %d regulators and %d panel genes",
++                   nrow(strong), length(unique(strong$tf)), length(unique(strong$gene))))
++   write.csv(obs, file.path(res_dir, "panel_tf_pairs.csv"), row.names = FALSE)
++   
++   reg_summary <- data.frame(
++     stratum = "oral tumors", n_tumors = ncol(E), n_pairs = nrow(obs),
++     n_significant = nrow(sig), n_strong = nrow(strong),
++     n_genes_responding = length(unique(sig$gene)),
++     n_genes_tested = length(unique(obs$gene)),
++     median_abs_rho = round(median(abs(sig$rho)), 3),
++     max_abs_rho = round(max(abs(sig$rho)), 3))
++   write.csv(reg_summary, file.path(res_dir, "panel_tf_summary.csv"), row.names = FALSE)
++   
++   unified_summary_rows[["regulator"]] <- data.frame(
++     layer = "regulator", stratum = "oral tumors", n_tumors = ncol(E), n_pairs = nrow(obs),
++     n_significant = nrow(sig), n_genes_responding = length(unique(sig$gene)),
++     n_genes_tested = length(unique(obs$gene)),
++     metric_type = "Spearman_rho",
++     median_effect = round(median(abs(sig$rho)), 3),
++     max_effect = round(max(abs(sig$rho)), 3))
++   
++   if (nrow(strong)) {
++     top <- as.data.frame(table(strong$tf), stringsAsFactors = FALSE)
++     names(top) <- c("tf", "n")
++     top <- top[order(-top$n), ]
++     write.csv(top, file.path(res_dir, "panel_tf_top_regulators.csv"), row.names = FALSE)
++   }
++ }
+
+regulator activity inferred for 197 transcription factors
+  2955 gene and regulator pairs, 1846 significant, |rho| median 0.27
+  pairs at |rho| of at least 0.4: 394, over 118 regulators and 12 panel genes
+> 
+> # ------------------------------------------------------------------------------
+> # Export Clean Summaries
+> # ------------------------------------------------------------------------------
+> if (length(driver_summary_rows)) {
++   drv_sum <- do.call(rbind, driver_summary_rows)
++   write.csv(drv_sum, file.path(res_dir, "panel_driver_summary.csv"), row.names = FALSE)
++ }
+> 
+> if (length(unified_summary_rows)) {
++   en <- do.call(rbind, unified_summary_rows)
++   write.csv(en, file.path(res_dir, "panel_grounding_summary.csv"), row.names = FALSE)
++   message("\n===== Panel response to the driver and regulator layers =====")
++   print(en, row.names = FALSE)
++ }
+
+===== Panel response to the driver and regulator layers =====
+     layer          stratum n_tumors n_pairs n_significant n_genes_responding n_genes_tested  metric_type median_effect
+    driver              all      304     195            16                 12             15       log2FC         0.562
+    driver non_hypermutated      300     180            18                 12             15       log2FC         0.722
+ regulator      oral tumors      304    2955          1846                 15             15 Spearman_rho         0.270
+ max_effect
+      1.679
+      1.710
+      0.757
+> 
+> message("\n>>> STEP 14 COMPLETE. Results in ", res_dir)
+
+>>> STEP 14 COMPLETE. Results in E:/OralCancer_Research/results

@@ -1,0 +1,22 @@
+# History and workspace images
+.Rhistory
+.RData
+.RDataTmp
+.Ruserdata
+
+# RStudio files
+.Rproj.user/
+
+# Large R binaries and model caches
+*.rds
+*.RData
+
+# Raw datasets (keep code reproducible via GEO accession IDs)
+data/raw/
+*.CEL
+*.tar.gz
+*.gz
+
+# System files
+.DS_Store
+Thumbs.db

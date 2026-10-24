@@ -1,0 +1,4 @@
+"arm","n_dysplasia","n_donor","n_field","n_cancer","mean_p_donor","mean_p_field","mean_p_cancer"
+"A",17,0,0,17,0.0551,0.0214,0.9235
+"B",17,0,4,13,0.0324,0.2566,0.711
+"C",17,0,1,16,0.0243,0.1087,0.8671

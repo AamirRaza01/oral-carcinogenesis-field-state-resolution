@@ -1,0 +1,10 @@
+"panel","gene","entrez","on_external_platform","external_symbol","symbol_match"
+"stable","CFAP251","144406",TRUE,"WDR66",FALSE
+"stable","COL1A1","1277",TRUE,"COL1A1",TRUE
+"stable","COL4A1","1282",TRUE,"COL4A1",TRUE
+"stable","COL4A2","1284",TRUE,"COL4A2",TRUE
+"stable","KRT17","3872",TRUE,"KRT17",TRUE
+"stable","LINC02487","441178",FALSE,NA,FALSE
+"stable","MMP1","4312",TRUE,"MMP1",TRUE
+"minimum","MMP1","4312",TRUE,"MMP1",TRUE
+"minimum","LINC02487","441178",FALSE,NA,FALSE

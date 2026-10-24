@@ -1,0 +1,353 @@
+Loaded 00_oral_common.R | base_dir = E:/OralCancer_Research
+> set.seed(42)
+> 
+> suppressPackageStartupMessages({
++   library(xgboost); library(pROC); library(ggplot2)
++ })
+> 
+> N_ITER        <- 200     # resampled splits per evaluation
+> AUC_TOLERANCE <- 0.01
+> CONTINUUM     <- c("donor", "field", "cancer")
+> 
+> manifest <- load_manifest()
+> manifest$continuum <- local({
++   lab <- rep(NA_character_, nrow(manifest))
++   lab[manifest$class == "cancer"] <- "cancer"
++   lab[manifest$class == "normal" & manifest$normal_provenance == "donor"] <- "donor"
++   lab[manifest$class == "normal" & manifest$normal_provenance != "donor"] <- "field"
++   factor(lab, levels = CONTINUUM)
++ })
+> message("Trained states:"); print(table(manifest$continuum))
+Trained states:
+
+ donor  field cancer 
+    54     63    329 
+> dysplasia_samples <- manifest$sample[manifest$class == "dysplasia"]
+> message(sprintf("Held out of every fit: %d dysplasia arrays", length(dysplasia_samples)))
+Held out of every fit: 17 dysplasia arrays
+> 
+> panels <- readRDS(file.path(res_dir, "continuum_panels.rds"))
+> 
+> # ------------------------------------------------------------------------------
+> # Multiclass metrics
+> # ------------------------------------------------------------------------------
+> macro_auc <- function(prob, truth) {
++   aucs <- vapply(seq_along(CONTINUUM), function(k) {
++     yk <- as.integer(truth == CONTINUUM[k])
++     if (length(unique(yk)) < 2) return(NA_real_)
++     as.numeric(pROC::roc(yk, prob[, k], quiet = TRUE)$auc)
++   }, numeric(1))
++   mean(aucs, na.rm = TRUE)
++ }
+> 
+> bal_acc <- function(pred, truth) {
++   mean(vapply(CONTINUUM, function(k) {
++     i <- truth == k
++     if (!any(i)) return(NA_real_)
++     mean(pred[i] == k)
++   }, numeric(1)), na.rm = TRUE)
++ }
+> 
+> fit_eval <- function(X, y, genes, n_iter = N_ITER, collect_cm = FALSE) {
++   yi <- as.integer(factor(y, levels = CONTINUUM)) - 1L
++   aucs <- numeric(0); baccs <- numeric(0)
++   K <- length(CONTINUUM)
++   cm <- matrix(0, K, K, dimnames = list(CONTINUUM, CONTINUUM))
++   for (it in seq_len(n_iter)) {
++     sp <- stratified_split(factor(y, levels = CONTINUUM))
++     dtr <- xgb.DMatrix(X[sp$train, genes, drop = FALSE], label = yi[sp$train])
++     dvl <- xgb.DMatrix(X[sp$val,   genes, drop = FALSE], label = yi[sp$val])
++     fit <- tryCatch(xgb.train(list(objective = "multi:softprob", num_class = K,
++                                    eval_metric = "mlogloss", max_depth = 4,
++                                    eta = 0.1, subsample = 0.8,
++                                    colsample_bytree = 0.8, nthread = 1),
++                               dtr, nrounds = 400, evals = list(val = dvl),
++                               early_stopping_rounds = 20, verbose = 0),
++                     error = function(e) NULL)
++     if (is.null(fit)) next
++     p <- matrix(predict(fit, xgb.DMatrix(X[sp$test, genes, drop = FALSE])),
++                 ncol = K, byrow = TRUE)
++     truth <- as.character(y[sp$test])
++     pred <- CONTINUUM[max.col(p)]
++     aucs <- c(aucs, macro_auc(p, truth)); baccs <- c(baccs, bal_acc(pred, truth))
++     if (collect_cm)
++       for (i in seq_along(truth)) cm[truth[i], pred[i]] <- cm[truth[i], pred[i]] + 1
++   }
++   list(auc = aucs, bacc = baccs, cm = cm)
++ }
+> 
+> # ------------------------------------------------------------------------------
+> # Evaluate the multinomial panel per arm
+> # ------------------------------------------------------------------------------
+> eval_rows <- list(); cm_rows <- list(); min_rows <- list()
+> field_rows <- list(); dys_rows <- list()
+> 
+> for (arm in names(ARMS)) {
++   run <- paste("multinomial", arm, sep = "_")
++   if (!run %in% names(panels)) { message("\n", run, " absent, skipped"); next }
++   expr <- load_arm(arm)
++   samp <- intersect(manifest$sample[!is.na(manifest$continuum)], colnames(expr))
++   y <- manifest$continuum[match(samp, manifest$sample)]
++   X <- t(expr[, samp, drop = FALSE])
++   X_dys <- t(expr[, intersect(dysplasia_samples, colnames(expr)), drop = FALSE])
++   
++   genes <- intersect(panels[[run]], colnames(X))
++   if (length(genes) < 2) { message("\n", run, ": panel too small"); next }
++   message(sprintf("\n===== %s | %d genes | %d arrays =====", run, length(genes), nrow(X)))
++   
++   r <- fit_eval(X, y, genes, collect_cm = TRUE)
++   q <- function(v) quantile(v, c(0.5, 0.025, 0.975), na.rm = TRUE)
++   qa <- q(r$auc); qb <- q(r$bacc)
++   message(sprintf("  multiclass AUC %.4f [%.4f, %.4f] | balanced accuracy %.4f [%.4f, %.4f]",
++                   qa[1], qa[2], qa[3], qb[1], qb[2], qb[3]))
++   recall <- diag(r$cm) / rowSums(r$cm)
++   message("  per-class recall: ",
++           paste(sprintf("%s %.3f (n=%d)", CONTINUUM, recall, rowSums(r$cm)), collapse = ", "))
++   
++   eval_rows[[arm]] <- data.frame(arm = arm, arm_label = ARM_LABEL[[arm]],
++                                  n_genes = length(genes), n_iter = length(r$auc),
++                                  auc = round(qa[1], 4), auc_lo = round(qa[2], 4),
++                                  auc_hi = round(qa[3], 4), bacc = round(qb[1], 4),
++                                  bacc_lo = round(qb[2], 4), bacc_hi = round(qb[3], 4))
++   cm_rows[[arm]] <- data.frame(arm = arm, as.data.frame(as.table(r$cm)))
++   
++   # ---- Feature Importance Ranking and Forward Selection ----
++   sp <- stratified_split(y)
++   yi <- as.integer(y) - 1L
++   dtr <- xgb.DMatrix(X[sp$train, genes, drop = FALSE], label = yi[sp$train])
++   dvl <- xgb.DMatrix(X[sp$val, genes, drop = FALSE], label = yi[sp$val])
++   fit <- xgb.train(list(objective = "multi:softprob", num_class = length(CONTINUUM),
++                         eval_metric = "mlogloss", max_depth = 4, eta = 0.1,
++                         subsample = 0.8, colsample_bytree = 0.8, nthread = 1),
++                    dtr, nrounds = 400, evals = list(val = dvl),
++                    early_stopping_rounds = 20, verbose = 0)
++   
++   # Calculate feature importance directly via Gain
++   imp_tab <- xgb.importance(model = fit)
++   ranked_genes <- intersect(imp_tab$Feature, genes)
++   unranked_genes <- setdiff(genes, ranked_genes)
++   gene_order <- c(ranked_genes, unranked_genes)
++   message("  top by importance: ", paste(head(gene_order, 10), collapse = ", "))
++   
++   full_auc <- median(r$auc, na.rm = TRUE)
++   chosen <- NULL
++   for (k in seq_along(gene_order)) {
++     rk <- fit_eval(X, y, gene_order[seq_len(k)], n_iter = 60)
++     ak <- median(rk$auc, na.rm = TRUE); bk <- median(rk$bacc, na.rm = TRUE)
++     message(sprintf("   size %2d/%d  AUC %.4f  BalAcc %.4f", k, length(gene_order), ak, bk))
++     min_rows[[paste(arm, k)]] <- data.frame(arm = arm, size = k,
++                                             gene_added = gene_order[k],
++                                             auc = round(ak, 4), bacc = round(bk, 4))
++     if (is.null(chosen) && ak >= full_auc - AUC_TOLERANCE) chosen <- k
++   }
++   if (!is.null(chosen)) {
++     message("  --> minimum panel: ", chosen, " genes, ",
++             paste(gene_order[seq_len(chosen)], collapse = ", "))
++     writeLines(gene_order[seq_len(chosen)],
++                file.path(res_dir, sprintf("continuum_minimum_%s.txt", arm)))
++   }
++   
++   # ---- Where the three-state model places the held-out dysplasia arrays ----
++   if (nrow(X_dys)) {
++     dp <- matrix(0, nrow(X_dys), length(CONTINUUM))
++     n_ok <- 0
++     for (m in seq_len(50)) {
++       spd <- stratified_split(y)
++       dtr2 <- xgb.DMatrix(X[spd$train, genes, drop = FALSE], label = yi[spd$train])
++       dvl2 <- xgb.DMatrix(X[spd$val, genes, drop = FALSE], label = yi[spd$val])
++       f3 <- tryCatch(xgb.train(list(objective = "multi:softprob",
++                                     num_class = length(CONTINUUM),
++                                     eval_metric = "mlogloss", max_depth = 4, eta = 0.1,
++                                     subsample = 0.8, colsample_bytree = 0.8, nthread = 1),
++                                dtr2, nrounds = 400, evals = list(val = dvl2),
++                                early_stopping_rounds = 20, verbose = 0),
++                      error = function(e) NULL)
++       if (is.null(f3)) next
++       dp <- dp + matrix(predict(f3, xgb.DMatrix(X_dys[, genes, drop = FALSE])),
++                         ncol = length(CONTINUUM), byrow = TRUE)
++       n_ok <- n_ok + 1
++     }
++     dp <- dp / max(n_ok, 1)
++     assign_to <- CONTINUUM[max.col(dp)]
++     tb <- table(factor(assign_to, levels = CONTINUUM))
++     message(sprintf("  held-out dysplasia, %d arrays assigned: %s", nrow(X_dys),
++                     paste(sprintf("%s %d", names(tb), as.integer(tb)), collapse = ", ")))
++     message(sprintf("    mean probability by state: %s",
++                     paste(sprintf("%s %.3f", CONTINUUM, colMeans(dp)), collapse = ", ")))
++     dys_rows[[arm]] <- data.frame(arm = arm, n_dysplasia = nrow(X_dys),
++                                   as.list(setNames(as.integer(tb), paste0("n_", CONTINUUM))),
++                                   as.list(setNames(round(colMeans(dp), 4),
++                                                    paste0("mean_p_", CONTINUUM))))
++   }
++   
++   # ---- Where a binary model places the field state ----
++   bin <- samp[y %in% c("donor", "cancer")]
++   yb <- as.integer(manifest$continuum[match(bin, manifest$sample)] == "cancer")
++   fld <- samp[y == "field"]
++   probs <- matrix(NA_real_, length(fld), 50)
++   for (m in seq_len(50)) {
++     spb <- stratified_split(factor(yb))
++     d1 <- xgb.DMatrix(X[bin[spb$train], genes, drop = FALSE], label = yb[spb$train])
++     d2 <- xgb.DMatrix(X[bin[spb$val], genes, drop = FALSE], label = yb[spb$val])
++     f2 <- tryCatch(xgb.train(list(objective = "binary:logistic", eval_metric = "logloss",
++                                   max_depth = 4, eta = 0.1, subsample = 0.8,
++                                   colsample_bytree = 0.8, nthread = 1),
++                              d1, nrounds = 400, evals = list(val = d2),
++                              early_stopping_rounds = 20, verbose = 0),
++                    error = function(e) NULL)
++     if (is.null(f2)) next
++     probs[, m] <- predict(f2, xgb.DMatrix(X[fld, genes, drop = FALSE]))
++   }
++   s <- rowMeans(probs, na.rm = TRUE)
++   message(sprintf("  binary donor against cancer, applied to %d held-out field arrays:",
++                   length(fld)))
++   message(sprintf("    above 0.5: %d (%.0f percent) | above 0.9: %d | median score %.3f",
++                   sum(s > 0.5), 100 * mean(s > 0.5), sum(s > 0.9), median(s)))
++   field_rows[[arm]] <- data.frame(arm = arm, n_field = length(fld),
++                                   above_half = sum(s > 0.5),
++                                   above_nine = sum(s > 0.9),
++                                   median_score = round(median(s), 4))
++   
++   cmdf <- as.data.frame(as.table(r$cm / rowSums(r$cm)))
++   names(cmdf) <- c("truth", "predicted", "fraction")
++   cmdf$truth <- factor(cmdf$truth, levels = rev(CONTINUUM))
++   cmdf$predicted <- factor(cmdf$predicted, levels = CONTINUUM)
++   p <- ggplot(cmdf, aes(predicted, truth, fill = fraction)) +
++     geom_tile() +
++     geom_text(aes(label = sprintf("%.2f", fraction)), size = 3.4, colour = "#0b0b0b") +
++     scale_fill_gradient(low = "white", high = "#2a78d6", limits = c(0, 1)) +
++     labs(title = sprintf("Arm %s, %s", arm, ARM_LABEL[[arm]])) +
++     theme_minimal(base_size = 11) +
++     theme(panel.grid = element_blank(), axis.title = element_blank(),
++           legend.position = "none")
++   ggsave(file.path(fig_dir, sprintf("continuum_confusion_%s.pdf", arm)), p,
++          width = 4, height = 3.6)
++   ggsave(file.path(fig_dir, sprintf("continuum_confusion_%s.png", arm)), p,
++          width = 4, height = 3.6, dpi = 300)
++ }
+
+===== multinomial_A | 16 genes | 446 arrays =====
+  multiclass AUC 0.7018 [0.6519, 0.7402] | balanced accuracy 0.3667 [0.2230, 0.5028]
+  per-class recall: donor 0.402 (n=2000), field 0.334 (n=2600), cancer 0.354 (n=13000)
+  top by importance: COL4A1, ENAH, MAGI1, MMP1, PCDH20, SORCS1, PADI1, CFAP251, TNFRSF10B, CAB39L
+   size  1/16  AUC 0.7250  BalAcc 0.3513
+   size  2/16  AUC 0.7319  BalAcc 0.3654
+   size  3/16  AUC 0.7090  BalAcc 0.3667
+   size  4/16  AUC 0.6981  BalAcc 0.3731
+   size  5/16  AUC 0.6987  BalAcc 0.3782
+   size  6/16  AUC 0.6944  BalAcc 0.3641
+   size  7/16  AUC 0.6990  BalAcc 0.3603
+   size  8/16  AUC 0.7083  BalAcc 0.3795
+   size  9/16  AUC 0.7042  BalAcc 0.3628
+   size 10/16  AUC 0.7072  BalAcc 0.3641
+   size 11/16  AUC 0.7029  BalAcc 0.3641
+   size 12/16  AUC 0.7088  BalAcc 0.3692
+   size 13/16  AUC 0.7065  BalAcc 0.3756
+   size 14/16  AUC 0.7107  BalAcc 0.3526
+   size 15/16  AUC 0.7030  BalAcc 0.3590
+   size 16/16  AUC 0.7022  BalAcc 0.3487
+  --> minimum panel: 1 genes, COL4A1
+  held-out dysplasia, 17 arrays assigned: donor 7, field 6, cancer 4
+    mean probability by state: donor 0.342, field 0.293, cancer 0.364
+  binary donor against cancer, applied to 63 held-out field arrays:
+    above 0.5: 59 (94 percent) | above 0.9: 31 | median score 0.900
+
+===== multinomial_B | 5 genes | 446 arrays =====
+  multiclass AUC 0.7234 [0.6877, 0.7653] | balanced accuracy 0.3538 [0.2204, 0.4926]
+  per-class recall: donor 0.388 (n=2000), field 0.343 (n=2600), cancer 0.353 (n=13000)
+  top by importance: COL4A2, MMP1, KRT17, COL1A1, SORCS1
+   size  1/5  AUC 0.7348  BalAcc 0.3436
+   size  2/5  AUC 0.7235  BalAcc 0.3551
+   size  3/5  AUC 0.7172  BalAcc 0.3500
+   size  4/5  AUC 0.7159  BalAcc 0.3756
+   size  5/5  AUC 0.7292  BalAcc 0.3487
+  --> minimum panel: 1 genes, COL4A2
+  held-out dysplasia, 17 arrays assigned: donor 6, field 5, cancer 6
+    mean probability by state: donor 0.340, field 0.229, cancer 0.430
+  binary donor against cancer, applied to 63 held-out field arrays:
+    above 0.5: 39 (62 percent) | above 0.9: 22 | median score 0.693
+
+===== multinomial_C | 10 genes | 446 arrays =====
+  multiclass AUC 0.7269 [0.6880, 0.7619] | balanced accuracy 0.3705 [0.2281, 0.4872]
+  per-class recall: donor 0.418 (n=2000), field 0.330 (n=2600), cancer 0.353 (n=13000)
+  top by importance: TPBG, COL1A1, PADI1, CFAP251, MMP1, COL4A1, SLC16A6, RSPO1, KRT17, COL4A2
+   size  1/10  AUC 0.7226  BalAcc 0.3385
+   size  2/10  AUC 0.7162  BalAcc 0.3449
+   size  3/10  AUC 0.7297  BalAcc 0.3731
+   size  4/10  AUC 0.7328  BalAcc 0.3397
+   size  5/10  AUC 0.7284  BalAcc 0.3615
+   size  6/10  AUC 0.7229  BalAcc 0.3577
+   size  7/10  AUC 0.7305  BalAcc 0.3577
+   size  8/10  AUC 0.7311  BalAcc 0.3577
+   size  9/10  AUC 0.7316  BalAcc 0.3641
+   size 10/10  AUC 0.7320  BalAcc 0.3679
+  --> minimum panel: 1 genes, TPBG
+  held-out dysplasia, 17 arrays assigned: donor 8, field 5, cancer 4
+    mean probability by state: donor 0.319, field 0.286, cancer 0.395
+  binary donor against cancer, applied to 63 held-out field arrays:
+    above 0.5: 35 (56 percent) | above 0.9: 16 | median score 0.617
+> 
+> for (nm in c("continuum_eval", "continuum_confusion", "continuum_minimum",
++              "field_assignment", "dysplasia_assignment")) {
++   rows <- switch(nm, continuum_eval = eval_rows, continuum_confusion = cm_rows,
++                  continuum_minimum = min_rows, field_assignment = field_rows,
++                  dysplasia_assignment = dys_rows)
++   if (length(rows)) {
++     df <- do.call(rbind, rows)
++     write.csv(df, file.path(res_dir, paste0(nm, ".csv")), row.names = FALSE)
++     message("\n===== ", nm, " =====")
++     if (nm != "continuum_minimum") print(df, row.names = FALSE)
++   }
++ }
+
+===== continuum_eval =====
+ arm           arm_label n_genes n_iter    auc auc_lo auc_hi   bacc bacc_lo bacc_hi
+   A       fRMA baseline      16    200 0.7018 0.6519 0.7402 0.3667  0.2230  0.5028
+   B   ComBat mod = NULL       5    200 0.7234 0.6877 0.7653 0.3538  0.2204  0.4926
+   C ComBat mod = ~class      10    200 0.7269 0.6880 0.7619 0.3705  0.2281  0.4872
+
+===== continuum_confusion =====
+ arm   Var1   Var2 Freq
+   A  donor  donor  803
+   A  field  donor  835
+   A cancer  donor 4149
+   A  donor  field  643
+   A  field  field  869
+   A cancer  field 4245
+   A  donor cancer  554
+   A  field cancer  896
+   A cancer cancer 4606
+   B  donor  donor  775
+   B  field  donor  837
+   B cancer  donor 4146
+   B  donor  field  645
+   B  field  field  891
+   B cancer  field 4263
+   B  donor cancer  580
+   B  field cancer  872
+   B cancer cancer 4591
+   C  donor  donor  836
+   C  field  donor  838
+   C cancer  donor 4078
+   C  donor  field  657
+   C  field  field  858
+   C cancer  field 4334
+   C  donor cancer  507
+   C  field cancer  904
+   C cancer cancer 4588
+
+===== continuum_minimum =====
+
+===== field_assignment =====
+ arm n_field above_half above_nine median_score
+   A      63         59         31       0.8999
+   B      63         39         22       0.6927
+   C      63         35         16       0.6166
+
+===== dysplasia_assignment =====
+ arm n_dysplasia n_donor n_field n_cancer mean_p_donor mean_p_field mean_p_cancer
+   A          17       7       6        4       0.3423       0.2933        0.3644
+   B          17       6       5        6       0.3403       0.2295        0.4303
+   C          17       8       5        4       0.3194       0.2861        0.3945
+> 
+> message("\n>>> STEP 13 COMPLETE. Results in ", res_dir)
